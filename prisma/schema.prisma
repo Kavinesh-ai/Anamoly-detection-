@@ -1,0 +1,496 @@
+// SentinelMesh — Prisma schema
+// Real persistent source of application state. No secrets stored in plaintext
+// (CloudCredential.secretCiphertext holds an envelope-encrypted blob, encrypted
+// with ENCRYPTION_KEY before it ever touches the DB — see src/server/crypto.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Identity & tenancy ----------
+
+model Organization {
+  id            String   @id @default(cuid())
+  name          String
+  slug          String   @unique
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  users         Membership[]
+  cloudAccounts CloudAccount[]
+  clusters      Cluster[]
+  applications  Application[]
+  vpcs          VPC[]
+  policies      SecurityPolicy[]
+  integrations  Integration[]
+  events        SecurityEvent[]
+  incidents     Incident[]
+  auditLogs     AuditLog[]
+  notifications Notification[]
+  connectors    DatacenterConnector[]
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String? // Argon2id; null if OAuth-only account
+  emailVerifiedAt DateTime?
+  mfaEnabled    Boolean  @default(false)
+  mfaSecret     String?  // encrypted at rest
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  memberships   Membership[]
+  auditLogs     AuditLog[]
+  sessions      Session[]
+  accounts      OAuthAccount[]
+}
+
+// NextAuth-compatible session/account tables
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model OAuthAccount {
+  id                String  @id @default(cuid())
+  userId            String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+enum RoleName {
+  SUPER_ADMIN
+  SECURITY_ADMIN
+  CLOUD_ENGINEER
+  KUBERNETES_ENGINEER
+  SECURITY_ANALYST
+  VIEWER
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  userId         String
+  organizationId String
+  role           RoleName
+  createdAt      DateTime     @default(now())
+
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+// ---------- Cloud / infra ----------
+
+enum CloudProviderType {
+  AWS
+}
+
+enum IntegrationStatus {
+  CONNECTED
+  DEGRADED
+  ERROR
+  NOT_CONFIGURED
+}
+
+model CloudAccount {
+  id             String            @id @default(cuid())
+  organizationId String
+  provider       CloudProviderType @default(AWS)
+  accountId      String // AWS account number
+  displayName    String
+  authMethod     String // "ASSUME_ROLE" | "ACCESS_KEY"
+  roleArn        String?
+  region         String
+  status         IntegrationStatus @default(NOT_CONFIGURED)
+  lastCheckedAt  DateTime?
+  lastError      String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  credential     IntegrationCredential?
+  vpcs           VPC[]
+  iamRoles       IAMRole[]
+
+  @@index([organizationId])
+}
+
+model IntegrationCredential {
+  id              String        @id @default(cuid())
+  cloudAccountId  String        @unique
+  // Envelope-encrypted secret material only. Never returned via API responses.
+  secretCiphertext String
+  secretIv        String
+  secretAuthTag   String
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  cloudAccount    CloudAccount  @relation(fields: [cloudAccountId], references: [id], onDelete: Cascade)
+}
+
+model VPC {
+  id             String   @id @default(cuid())
+  organizationId String
+  cloudAccountId String
+  vpcId          String // e.g. vpc-xxxx (real AWS id from discovery)
+  cidrBlock      String
+  region         String
+  discoveredAt   DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  cloudAccount   CloudAccount @relation(fields: [cloudAccountId], references: [id], onDelete: Cascade)
+  subnets        Subnet[]
+  securityGroups SecurityGroup[]
+
+  @@index([organizationId])
+  @@unique([cloudAccountId, vpcId])
+}
+
+model Subnet {
+  id        String @id @default(cuid())
+  vpcId     String
+  subnetId  String
+  cidrBlock String
+  az        String
+
+  vpc VPC @relation(fields: [vpcId], references: [id], onDelete: Cascade)
+
+  @@unique([vpcId, subnetId])
+}
+
+model SecurityGroup {
+  id         String   @id @default(cuid())
+  vpcId      String
+  groupId    String
+  name       String
+  description String?
+  riskLevel  String? // computed: LOW | MEDIUM | HIGH | CRITICAL
+  discoveredAt DateTime @default(now())
+
+  vpc   VPC @relation(fields: [vpcId], references: [id], onDelete: Cascade)
+  rules SecurityGroupRule[]
+
+  @@unique([vpcId, groupId])
+}
+
+model SecurityGroupRule {
+  id              String @id @default(cuid())
+  securityGroupId String
+  direction       String // INGRESS | EGRESS
+  protocol        String
+  fromPort        Int?
+  toPort          Int?
+  cidr            String?
+  referencedGroup String?
+
+  securityGroup SecurityGroup @relation(fields: [securityGroupId], references: [id], onDelete: Cascade)
+}
+
+model IAMRole {
+  id             String   @id @default(cuid())
+  cloudAccountId String
+  roleName       String
+  arn            String
+  riskLevel      String?
+  riskReason     String?
+  lastUsedAt     DateTime?
+  discoveredAt   DateTime @default(now())
+
+  cloudAccount CloudAccount @relation(fields: [cloudAccountId], references: [id], onDelete: Cascade)
+  policies     IAMPolicy[]
+
+  @@unique([cloudAccountId, arn])
+}
+
+model IAMPolicy {
+  id        String @id @default(cuid())
+  iamRoleId String
+  name      String
+  document  Json // actual policy JSON from AWS
+
+  iamRole IAMRole @relation(fields: [iamRoleId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Kubernetes ----------
+
+model Cluster {
+  id             String            @id @default(cuid())
+  organizationId String
+  name           String
+  apiServerUrl   String
+  status         IntegrationStatus @default(NOT_CONFIGURED)
+  lastCheckedAt  DateTime?
+  lastError      String?
+  createdAt      DateTime          @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  namespaces   Namespace[]
+
+  @@index([organizationId])
+}
+
+model Namespace {
+  id        String @id @default(cuid())
+  clusterId String
+  name      String
+  discoveredAt DateTime @default(now())
+
+  cluster    Cluster     @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  workloads  Workload[]
+  netPolicies NetworkPolicy[]
+
+  @@unique([clusterId, name])
+}
+
+model Workload {
+  id          String @id @default(cuid())
+  namespaceId String
+  name        String
+  kind        String // Deployment | StatefulSet | DaemonSet | Pod
+  image       String?
+  discoveredAt DateTime @default(now())
+
+  namespace Namespace @relation(fields: [namespaceId], references: [id], onDelete: Cascade)
+}
+
+model NetworkPolicy {
+  id          String @id @default(cuid())
+  namespaceId String
+  name        String
+  manifest    Json // actual K8s NetworkPolicy spec
+  appliedAt   DateTime?
+  discoveredAt DateTime @default(now())
+
+  namespace Namespace @relation(fields: [namespaceId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Applications ----------
+
+model Application {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  environment    String // development | testing | production | management | security
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dependenciesFrom ApplicationDependency[] @relation("SourceApp")
+  dependenciesTo   ApplicationDependency[] @relation("DestApp")
+
+  @@index([organizationId])
+}
+
+model ApplicationDependency {
+  id            String @id @default(cuid())
+  sourceAppId   String
+  destAppId     String
+  protocol      String
+  port          Int
+
+  sourceApp Application @relation("SourceApp", fields: [sourceAppId], references: [id], onDelete: Cascade)
+  destApp   Application @relation("DestApp", fields: [destAppId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Policy engine ----------
+
+enum PolicyAction {
+  ALLOW
+  DENY
+}
+
+enum DeploymentStatus {
+  DRAFT
+  VALIDATING
+  AWAITING_APPROVAL
+  APPROVED
+  DEPLOYING
+  VERIFYING
+  SUCCESS
+  FAILED
+  ROLLED_BACK
+}
+
+model SecurityPolicy {
+  id             String       @id @default(cuid())
+  organizationId String
+  name           String
+  source         String
+  destination    String
+  protocol       String
+  port           Int?
+  action         PolicyAction
+  environment    String?
+  priority       Int          @default(100)
+  status         String       @default("DRAFT")
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  rules        PolicyRule[]
+  deployments  PolicyDeployment[]
+
+  @@index([organizationId])
+}
+
+model PolicyRule {
+  id       String @id @default(cuid())
+  policyId String
+  key      String // e.g. "condition:identity"
+  value    String
+
+  policy SecurityPolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+}
+
+model PolicyDeployment {
+  id         String           @id @default(cuid())
+  policyId   String
+  status     DeploymentStatus @default(DRAFT)
+  validationResult Json?
+  error      String?
+  deployedBy String?
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  policy SecurityPolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Integrations ----------
+
+model Integration {
+  id             String            @id @default(cuid())
+  organizationId String
+  type           String // AWS | KUBERNETES | DATACENTER_CONNECTOR | IDENTITY_PROVIDER | LOGGING
+  status         IntegrationStatus @default(NOT_CONFIGURED)
+  lastCheckedAt  DateTime?
+  lastError      String?
+  config         Json? // non-secret config only
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+model DatacenterConnector {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  connectorKeyHash String // hashed unique connector identity credential
+  lastHeartbeatAt DateTime?
+  status         String  @default("NOT_CONNECTED")
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Security events / incidents ----------
+
+model SecurityEvent {
+  id             String   @id @default(cuid())
+  organizationId String
+  timestamp      DateTime @default(now())
+  source         String
+  destination    String?
+  identity       String?
+  action         String
+  resource       String?
+  protocol       String?
+  port           Int?
+  severity       String
+  provider       String?
+  rawEvent       Json?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, timestamp])
+}
+
+model Incident {
+  id             String   @id @default(cuid())
+  organizationId String
+  title          String
+  severity       String
+  status         String   @default("OPEN")
+  detectionReason String
+  assignedAnalyst String?
+  resolution     String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  events       IncidentEvent[]
+
+  @@index([organizationId])
+}
+
+model IncidentEvent {
+  id         String   @id @default(cuid())
+  incidentId String
+  timestamp  DateTime @default(now())
+  note       String
+  actor      String?
+
+  incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Audit / notifications ----------
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  actorId        String?
+  action         String
+  resource       String
+  before         Json?
+  after          Json?
+  ip             String?
+  result         String
+  timestamp      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actor        User?        @relation(fields: [actorId], references: [id])
+
+  @@index([organizationId, timestamp])
+}
+
+model Notification {
+  id             String   @id @default(cuid())
+  organizationId String
+  title          String
+  body           String
+  severity       String   @default("INFO")
+  read           Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
